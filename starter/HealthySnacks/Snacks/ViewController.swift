@@ -27,6 +27,10 @@
 /// THE SOFTWARE.
 
 import UIKit
+import CoreMedia
+import CoreML
+import Vision
+
 
 class ViewController: UIViewController {
   
@@ -45,7 +49,28 @@ class ViewController: UIViewController {
     resultsView.alpha = 0
     resultsLabel.text = "choose or take a photo"
   }
+    let semphore = DispatchSemaphore(value: ViewController.maxInflightBuffer)
+    var inflightBuffer = 0
+    static let maxInflightBuffer = 2
 
+    lazy var classificationRequest: VNCoreMLRequest = {
+        do{
+            let classifier = try MySnacks_1(configuration: MLModelConfiguration())
+            
+            let model = try VNCoreMLModel(for: classifier.model)
+            let request = VNCoreMLRequest(model: model, completionHandler: {
+                [weak self] request,error in
+                self?.processObservations(for: request, error: error)
+            })
+            request.imageCropAndScaleOption = .centerCrop
+            return request
+            
+            
+        } catch {
+            fatalError("Failed to create request")
+        }
+    }()
+    
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
 
@@ -96,7 +121,48 @@ class ViewController: UIViewController {
   }
 
   func classify(image: UIImage) {
+      semphore.wait()
+      inflightBuffer += 1
+      if inflightBuffer >= ViewController.maxInflightBuffer {
+          inflightBuffer = 0
+      }
+      DispatchQueue.main.async {
+          //let _image=image.resizeImageTo(size: CGSize(width: 299, height: 299))
+          var pixelbuffer=self.buffer(from: image)
+          let handler = VNImageRequestHandler(cvPixelBuffer: pixelbuffer!, options: [:])
+          do {
+              try handler.perform([self.classificationRequest])
+          } catch {
+              print("Failed to perform classification: \(error)")
+          }
+          self.semphore.signal()
+      }
   }
+    
+    func buffer(from image: UIImage) -> CVPixelBuffer? {
+      let attrs = [kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue, kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue] as CFDictionary
+      var pixelBuffer : CVPixelBuffer?
+      let status = CVPixelBufferCreate(kCFAllocatorDefault, Int(image.size.width), Int(image.size.height), kCVPixelFormatType_32ARGB, attrs, &pixelBuffer)
+      guard (status == kCVReturnSuccess) else {
+        return nil
+      }
+
+      CVPixelBufferLockBaseAddress(pixelBuffer!, CVPixelBufferLockFlags(rawValue: 0))
+      let pixelData = CVPixelBufferGetBaseAddress(pixelBuffer!)
+
+      let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
+      let context = CGContext(data: pixelData, width: Int(image.size.width), height: Int(image.size.height), bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer!), space: rgbColorSpace, bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)
+
+      context?.translateBy(x: 0, y: image.size.height)
+      context?.scaleBy(x: 1.0, y: -1.0)
+
+      UIGraphicsPushContext(context!)
+      image.draw(in: CGRect(x: 0, y: 0, width: image.size.width, height: image.size.height))
+      UIGraphicsPopContext()
+      CVPixelBufferUnlockBaseAddress(pixelBuffer!, CVPixelBufferLockFlags(rawValue: 0))
+
+      return pixelBuffer
+    }
 }
 
 extension ViewController: UIImagePickerControllerDelegate, UINavigationControllerDelegate {
@@ -108,4 +174,28 @@ extension ViewController: UIImagePickerControllerDelegate, UINavigationControlle
 
     classify(image: image)
   }
+}
+
+extension ViewController {
+    func processObservations(for request: VNRequest, error: Error?) {
+        if let results = request.results as? [VNClassificationObservation] {
+            if results.isEmpty {
+                self.resultsLabel.text = "Nothing found"
+            } else {
+                let result = results[0].identifier
+                let confidence = results[0].confidence
+                if confidence>0.6{
+                    self.resultsLabel.text = result+"\r\n"+String(format: "%.1f%%", confidence * 100)
+                }else{
+                    self.resultsLabel.text = "I'm not sure..."
+                }
+                self.showResultsView()
+                print(result)
+            }
+        } else if let error = error {
+            self.resultsLabel.text = "Error: \(error.localizedDescription)"
+        } else {
+            self.resultsLabel.text = "???"
+        }
+    }
 }
